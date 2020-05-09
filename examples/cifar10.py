@@ -5,6 +5,10 @@ Based on:
 """
 
 import argparse
+import os
+import csv
+import shutil
+from contextlib import redirect_stdout
 
 import torch
 import torchvision
@@ -36,6 +40,10 @@ parser.add_argument('--model-name', type=str, default='resnet50', metavar='M',
                     help='model name (default: resnet50)')
 parser.add_argument('--dropout-p', type=float, default=0.2, metavar='D',
                     help='Dropout probability (default: 0.2)')
+parser.add_argument('--log_dir', type=str, default=None,
+                    help='Directory to save log')
+parser.add_argument('--desc', type=str, default='',
+                    help='description of test')
 
 args = parser.parse_args()
 use_cuda = not args.no_cuda and torch.cuda.is_available()
@@ -46,10 +54,13 @@ def train(model, epoch, optimizer, train_loader, criterion=nn.CrossEntropyLoss()
     total_loss = 0
     total_size = 0
     model.train()
+    correct = 0
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
+        pred = output.data.max(1, keepdim=True)[1]
+        correct += pred.eq(target.data.view_as(pred)).long().cpu().sum().item()
         loss = criterion(output, target)
         total_loss += loss.item()
         total_size += data.size(0)
@@ -59,6 +70,8 @@ def train(model, epoch, optimizer, train_loader, criterion=nn.CrossEntropyLoss()
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tAverage loss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), total_loss / total_size))
+
+    return {'train_loss': total_loss/total_size, 'train_acc': correct / len(train_loader.dataset)}
 
 
 def test(model, test_loader, criterion=nn.CrossEntropyLoss()):
@@ -74,9 +87,12 @@ def test(model, test_loader, criterion=nn.CrossEntropyLoss()):
             correct += pred.eq(target.data.view_as(pred)).long().cpu().sum().item()
 
     test_loss /= len(test_loader.dataset)
+    acc = correct / len(test_loader.dataset)
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+        100. * acc))
+
+    return {"test_loss": test_loss, "acc": acc}
 
 
 def main():
@@ -126,12 +142,84 @@ def main():
     # Use exponential decay for fine-tuning optimizer
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.975)
 
+
+    # create log dir and files
+    if (args.log_dir is None):
+        model_dir = os.path.join(os.getcwd(), "logs", "cifar10", args.model_name, args.desc)
+    else:
+        model_dir = args.log_dir
+    if not os.path.isdir(model_dir):
+        os.makedirs(model_dir, exist_ok=True)
+
+    with open(os.path.join(model_dir, "train_log.csv"), "w") as train_log_file:
+        train_log_csv = csv.writer(train_log_file)
+        train_log_csv.writerow(['epoch', 'train_loss', 'train_acc', 'test_loss', 'test_acc'])
+
+    with open(os.path.join(model_dir, 'command_args.txt'), 'w') as command_args_file:
+        for arg, value in sorted(vars(args).items()):
+            command_args_file.write(arg + ": " + str(value) + "\n")
+
+    with open(os.path.join(model_dir, 'model.txt'), 'w') as model_txt_file:
+        with redirect_stdout(model_txt_file):
+            print(model)
+
     # Train
+    is_best = False
+    best_acc1 = 0
     for epoch in range(1, args.epochs + 1):
         # Decay Learning Rate
         scheduler.step(epoch)
-        train(model, epoch, optimizer, train_loader)
-        test(model, test_loader)
+        train_log = train(model, epoch, optimizer, train_loader)
+        test_log = test(model, test_loader)
+
+        # append to log
+        with open(os.path.join(model_dir, "train_log.csv"), "a") as train_log_file:
+            train_log_csv = csv.writer(train_log_file)
+            train_log_csv.writerow(((epoch,) + tuple(train_log.values()) + tuple(test_log.values()))) 
+
+
+        acc1 = test_log["acc"]
+        if acc1 > best_acc1:
+            best_acc1 = acc1
+            is_best = True
+        else:
+            is_best = False
+
+        # save checkpoint
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'arch': args.model_name,
+            'state_dict': model.state_dict(),
+            'best_acc1': best_acc1,
+            'optimizer' : optimizer.state_dict(),
+            'lr_scheduler' : scheduler,
+        }, is_best, model_dir)
+
+        if(is_best):
+            torch.save(model, os.path.join(model_dir, "model.pth"))
+            torch.save(model.state_dict(), os.path.join(model_dir, "weights.pth"))
+
+        # save weights
+        os.makedirs(os.path.join(model_dir, 'weights_logs'), exist_ok=True)
+        with open(os.path.join(model_dir, 'weights_logs', 'weights_log_' + str(epoch) + '.txt'), 'w') as weights_log_file:
+            with redirect_stdout(weights_log_file):
+                # Log model's state_dict
+                print("Model's state_dict:")
+                # TODO: Use checkpoint above
+                for param_tensor in model.state_dict():
+                    print(param_tensor, "\t", model.state_dict()[param_tensor].size())
+                    print(model.state_dict()[param_tensor])
+                    print("")
+
+
+def save_checkpoint(state, is_best, dir_path, filename='checkpoint.pth.tar'):
+    torch.save(state, os.path.join(dir_path, filename))
+    if is_best:
+        shutil.copyfile(os.path.join(dir_path, filename), os.path.join(dir_path, 'checkpoint_best.pth.tar'))
+
+    if (state['epoch']-1)%10 == 0:
+        os.makedirs(os.path.join(dir_path, 'checkpoints'), exist_ok=True)
+        shutil.copyfile(os.path.join(dir_path, filename), os.path.join(dir_path, 'checkpoints', 'checkpoint_' + str(state['epoch']-1) + '.pth.tar'))    
 
 
 if __name__ == '__main__':
